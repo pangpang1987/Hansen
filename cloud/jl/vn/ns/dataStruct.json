@@ -1,0 +1,224 @@
+{
+    "roads": {
+        "type": "list",
+        "required": true,
+        "value": {
+            "id": {
+                "type": "str",
+                "required": true
+            },
+            "s": {
+                "type": "str",
+                "required": true
+            },
+            "t": {
+                "type": "str",
+                "required": true
+            },
+            "r": {
+                "type": "float",
+                "required": true
+            },
+            "ex": {
+                "type": "float",
+                "required": true
+            },
+            "initQ": {
+                "type": "float",
+                "required": true
+            },
+            "fixed": {
+                "type": "enum",
+                "required": false,
+                "options": [
+                    true,
+                    false
+                ]
+            },
+            "weight": {
+                "type": "float",
+                "required": true
+            }
+        }
+    },
+    "fanAs": {
+        "type": "list",
+        "required": false,
+        "value": {
+            "id": {
+                "type": "str",
+                "required": true
+            },
+            "eid": {
+                "type": "id",
+                "required": true
+            },
+            "a0": {
+                "type": "float",
+                "required": true
+            },
+            "a1": {
+                "type": "float",
+                "required": true
+            },
+            "a2": {
+                "type": "float",
+                "required": true,
+                "max": 0,
+                "excludeMax": true
+            },
+            "direction": {
+                "type": "enum",
+                "required": true,
+                "options": [
+                    "forward",
+                    "reverse"
+                ]
+            },
+            "pitotLocation": {
+                "type": "enum",
+                "required": true,
+                "options": [
+                    "in",
+                    "out"
+                ]
+            }
+        }
+    },
+    "fanBs": {
+        "type": "list",
+        "required": false,
+        "value": {
+            "id": {
+                "type": "str",
+                "required": true
+            },
+            "eid": {
+                "type": "id",
+                "required": true
+            },
+            "a0": {
+                "type": "float",
+                "required": true
+            },
+            "a1": {
+                "type": "float",
+                "required": true
+            },
+            "a2": {
+                "type": "float",
+                "required": true,
+                "max": 0,
+                "excludeMax": true
+            },
+            "b0": {
+                "type": "float",
+                "required": true
+            },
+            "b1": {
+                "type": "float",
+                "required": true
+            },
+            "b2": {
+                "type": "float",
+                "required": true,
+                "min": 0,
+                "excludeMin": true
+            },
+            "tangentQ": {
+                "type": "float",
+                "required": true
+            },
+            "direction": {
+                "type": "enum",
+                "required": true,
+                "options": [
+                    "forward",
+                    "reverse"
+                ]
+            },
+            "pitotLocation": {
+                "type": "enum",
+                "required": true,
+                "options": [
+                    "in",
+                    "out"
+                ]
+            }
+        }
+    },
+    "fanHs": {
+        "type": "list",
+        "required": false,
+        "value": {
+            "id": {
+                "type": "str",
+                "required": true
+            },
+            "eid": {
+                "type": "id",
+                "required": true
+            },
+            "h": {
+                "type": "float",
+                "required": true
+            },
+            "direction": {
+                "type": "enum",
+                "required": true,
+                "options": [
+                    "forward",
+                    "reverse"
+                ]
+            },
+            "pitotLocation": {
+                "type": "enum",
+                "required": true,
+                "options": [
+                    "in",
+                    "out"
+                ]
+            }
+        }
+    },
+    "structRs": {
+        "type": "list",
+        "required": false,
+        "value": {
+            "id": {
+                "type": "str",
+                "required": true
+            },
+            "eid": {
+                "type": "id",
+                "required": true
+            },
+            "r": {
+                "type": "float",
+                "required": true
+            },
+            "ex": {
+                "type": "float",
+                "required": true
+            }
+        }
+    },
+    "structHs": {
+        "type": "list",
+        "required": false,
+        "value": {
+            "id": {
+                "type": "str",
+                "required": true
+            },
+            "eid": {
+                "type": "id",
+                "required": true
+            },
+            "h": {
+                "type": "float",
+                "required": true
+            }
+        }
+    }
+}
