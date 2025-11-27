@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from typing import List, Dict, Optional, Callable
 import time
+import json
+import os
+from datetime import datetime
 from dataclasses import dataclass, field
 from threading import Thread, Lock
 import queue
@@ -76,40 +79,40 @@ class LiveVisualizer:
     def _setup_figure(self):
         """设置图形和子图"""
         self.fig, self.axes = plt.subplots(2, 2, figsize=(14, 10))
-        self.fig.suptitle('CMA-ES 反演优化实时监控', fontsize=14, fontweight='bold')
+        self.fig.suptitle('CMA-ES Inversion Optimization Monitor', fontsize=14, fontweight='bold')
         
         # 子图1: 损失曲线
         self.ax_loss = self.axes[0, 0]
-        self.ax_loss.set_xlabel('迭代次数')
-        self.ax_loss.set_ylabel('损失值')
-        self.ax_loss.set_title('损失函数收敛曲线')
+        self.ax_loss.set_xlabel('Iteration')
+        self.ax_loss.set_ylabel('Loss')
+        self.ax_loss.set_title('Loss Convergence')
         self.ax_loss.set_yscale('log')
         self.ax_loss.grid(True, alpha=0.3)
-        self.line_loss, = self.ax_loss.plot([], [], 'b-', linewidth=2, label='当前损失')
-        self.line_best, = self.ax_loss.plot([], [], 'r--', linewidth=1.5, label='最佳损失')
+        self.line_loss, = self.ax_loss.plot([], [], 'b-', linewidth=2, label='Current')
+        self.line_best, = self.ax_loss.plot([], [], 'r--', linewidth=1.5, label='Best')
         self.ax_loss.legend(loc='upper right')
         
         # 子图2: Sigma 变化
         self.ax_sigma = self.axes[0, 1]
-        self.ax_sigma.set_xlabel('迭代次数')
-        self.ax_sigma.set_ylabel('σ (步长)')
-        self.ax_sigma.set_title('CMA-ES 步长变化')
+        self.ax_sigma.set_xlabel('Iteration')
+        self.ax_sigma.set_ylabel('Sigma (Step Size)')
+        self.ax_sigma.set_title('CMA-ES Step Size')
         self.ax_sigma.grid(True, alpha=0.3)
         self.line_sigma, = self.ax_sigma.plot([], [], 'g-', linewidth=2)
         
         # 子图3: 残差分布
         self.ax_residual = self.axes[1, 0]
-        self.ax_residual.set_xlabel('测点索引')
-        self.ax_residual.set_ylabel('残差 (预测 - 目标)')
-        self.ax_residual.set_title('测点残差分布')
+        self.ax_residual.set_xlabel('Measurement Index')
+        self.ax_residual.set_ylabel('Residual (Pred - Target)')
+        self.ax_residual.set_title('Residual Distribution')
         self.ax_residual.axhline(y=0, color='black', linestyle='-', linewidth=1)
         self.ax_residual.grid(True, alpha=0.3)
         
         # 子图4: 预测 vs 目标
         self.ax_scatter = self.axes[1, 1]
-        self.ax_scatter.set_xlabel('目标值 (m³/s)')
-        self.ax_scatter.set_ylabel('预测值 (m³/s)')
-        self.ax_scatter.set_title('预测值 vs 目标值')
+        self.ax_scatter.set_xlabel('Target Q (m3/s)')
+        self.ax_scatter.set_ylabel('Predicted Q (m3/s)')
+        self.ax_scatter.set_title('Predicted vs Target')
         self.ax_scatter.grid(True, alpha=0.3)
         
         # 状态文本
@@ -172,9 +175,9 @@ class LiveVisualizer:
             # 更新残差图
             if self.state.current_residuals is not None:
                 self.ax_residual.clear()
-                self.ax_residual.set_xlabel('测点索引')
-                self.ax_residual.set_ylabel('残差 (预测 - 目标)')
-                self.ax_residual.set_title('测点残差分布')
+                self.ax_residual.set_xlabel('Measurement Index')
+                self.ax_residual.set_ylabel('Residual (Pred - Target)')
+                self.ax_residual.set_title('Residual Distribution')
                 self.ax_residual.axhline(y=0, color='black', linestyle='-', linewidth=1)
                 self.ax_residual.grid(True, alpha=0.3)
                 
@@ -189,9 +192,9 @@ class LiveVisualizer:
             # 更新预测 vs 目标散点图
             if self.state.current_y_pred is not None:
                 self.ax_scatter.clear()
-                self.ax_scatter.set_xlabel('目标值 (m³/s)')
-                self.ax_scatter.set_ylabel('预测值 (m³/s)')
-                self.ax_scatter.set_title('预测值 vs 目标值')
+                self.ax_scatter.set_xlabel('Target Q (m3/s)')
+                self.ax_scatter.set_ylabel('Predicted Q (m3/s)')
+                self.ax_scatter.set_title('Predicted vs Target')
                 self.ax_scatter.grid(True, alpha=0.3)
                 
                 y_pred = self.state.current_y_pred
@@ -203,7 +206,7 @@ class LiveVisualizer:
                 min_val = min(y_target.min(), y_pred.min())
                 max_val = max(y_target.max(), y_pred.max())
                 self.ax_scatter.plot([min_val, max_val], [min_val, max_val], 
-                                    'r--', linewidth=2, label='理想拟合')
+                                    'r--', linewidth=2, label='Ideal')
                 self.ax_scatter.legend()
             
             # 更新状态文本
@@ -212,14 +215,14 @@ class LiveVisualizer:
                 rel_err = np.mean(np.abs(self.state.current_residuals) / (np.abs(self.y_target) + 0.1)) * 100 if self.state.current_residuals is not None else 0
                 
                 status = (
-                    f"迭代: {self.state.iteration:4d} | "
-                    f"损失: {self.state.loss_history[-1]:.4e} | "
-                    f"最佳: {min(self.state.best_loss_history):.4e} | "
-                    f"σ: {self.state.sigma_history[-1]:.4f} | "
-                    f"评估: {self.state.eval_count:5d} | "
+                    f"Iter: {self.state.iteration:4d} | "
+                    f"Loss: {self.state.loss_history[-1]:.4e} | "
+                    f"Best: {min(self.state.best_loss_history):.4e} | "
+                    f"Sigma: {self.state.sigma_history[-1]:.4f} | "
+                    f"Evals: {self.state.eval_count:5d} | "
                     f"RMSE: {rmse:.3f} | "
-                    f"相对误差: {rel_err:.1f}% | "
-                    f"时间: {self.state.elapsed_time:.1f}s"
+                    f"RelErr: {rel_err:.1f}% | "
+                    f"Time: {self.state.elapsed_time:.1f}s"
                 )
                 self.status_text.set_text(status)
         
@@ -261,6 +264,174 @@ class LiveVisualizer:
         plt.show()
 
 
+class IterationResultSaver:
+    """
+    迭代结果保存器
+    
+    将每次迭代的结果保存到 results 文件夹下的 JSON 文件
+    """
+    
+    def __init__(self, 
+                 output_dir: str = "results",
+                 save_every: int = 1,
+                 network_data = None,
+                 inv_config = None):
+        """
+        参数:
+        - output_dir: 输出目录
+        - save_every: 每隔多少次迭代保存一次
+        - network_data: 网络数据（用于保存巷道ID等信息）
+        - inv_config: 反演配置
+        """
+        self.output_dir = output_dir
+        self.save_every = save_every
+        self.network_data = network_data
+        self.inv_config = inv_config
+        
+        # 创建带时间戳的运行目录
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_dir = os.path.join(output_dir, f"run_{self.timestamp}")
+        
+        # 创建目录
+        os.makedirs(self.run_dir, exist_ok=True)
+        print(f"结果将保存到: {self.run_dir}")
+        
+        # 保存运行配置
+        self._save_run_config()
+    
+    def _save_run_config(self):
+        """保存运行配置"""
+        config_data = {
+            "timestamp": self.timestamp,
+            "save_every": self.save_every,
+            "n_roads": len(self.network_data.roads) if self.network_data else 0,
+            "n_measurements": len(self.inv_config.target_values) if self.inv_config else 0,
+        }
+        
+        config_path = os.path.join(self.run_dir, "run_config.json")
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config_data, f, indent=2, ensure_ascii=False)
+    
+    def save_iteration(self,
+                       iteration: int,
+                       x_best: np.ndarray,
+                       loss: float,
+                       best_loss: float,
+                       sigma: float,
+                       eval_count: int,
+                       elapsed_time: float,
+                       y_pred: Optional[np.ndarray] = None,
+                       y_target: Optional[np.ndarray] = None):
+        """
+        保存单次迭代结果
+        """
+        if iteration % self.save_every != 0:
+            return
+        
+        # 构建结果数据
+        result_data = {
+            "iteration": iteration,
+            "timestamp": datetime.now().isoformat(),
+            "metrics": {
+                "loss": float(loss),
+                "best_loss": float(best_loss),
+                "sigma": float(sigma),
+                "eval_count": eval_count,
+                "elapsed_time": float(elapsed_time)
+            }
+        }
+        
+        # 添加预测误差统计
+        if y_pred is not None and y_target is not None:
+            residuals = y_pred - y_target
+            result_data["metrics"]["rmse"] = float(np.sqrt(np.mean(residuals**2)))
+            result_data["metrics"]["mae"] = float(np.mean(np.abs(residuals)))
+            result_data["metrics"]["max_error"] = float(np.max(np.abs(residuals)))
+            result_data["metrics"]["relative_error_percent"] = float(
+                np.mean(np.abs(residuals) / (np.abs(y_target) + 0.1)) * 100
+            )
+        
+        # 解码并保存优化后的风阻参数
+        if self.inv_config and self.network_data:
+            R_opt, H_opt = self.inv_config.decode_parameters(x_best)
+            
+            # 保存风阻变化
+            result_data["optimized_R"] = {}
+            for i, road in enumerate(self.network_data.roads):
+                r0 = road.r0
+                r_opt = float(R_opt[i])
+                change_percent = (r_opt - r0) / r0 * 100 if r0 != 0 else 0
+                result_data["optimized_R"][road.id] = {
+                    "r0": r0,
+                    "r_optimized": r_opt,
+                    "change_percent": float(change_percent)
+                }
+            
+            # 保存测点预测值
+            if y_pred is not None and y_target is not None:
+                result_data["measurements"] = {}
+                for i, idx in enumerate(self.inv_config.measurement_indices):
+                    road = self.network_data.roads[idx]
+                    result_data["measurements"][road.id] = {
+                        "target": float(y_target[i]),
+                        "predicted": float(y_pred[i]),
+                        "residual": float(y_pred[i] - y_target[i])
+                    }
+        
+        # 保存到文件
+        filename = f"iter_{iteration:05d}.json"
+        filepath = os.path.join(self.run_dir, filename)
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(result_data, f, indent=2, ensure_ascii=False)
+    
+    def save_final_summary(self, 
+                           result,
+                           total_iterations: int):
+        """
+        保存最终汇总结果
+        """
+        summary_data = {
+            "run_id": self.timestamp,
+            "completed_at": datetime.now().isoformat(),
+            "total_iterations": total_iterations,
+            "final_metrics": {
+                "best_loss": float(result.loss_best),
+                "total_evaluations": result.n_evaluations,
+                "elapsed_time": float(result.elapsed_time)
+            },
+            "convergence_info": {
+                k: (float(v) if isinstance(v, (int, float, np.number)) else str(v))
+                for k, v in result.convergence_info.items()
+            }
+        }
+        
+        # 保存最终参数（完整）
+        if self.inv_config and self.network_data:
+            R_opt, H_opt = self.inv_config.decode_parameters(result.x_best)
+            
+            summary_data["final_R"] = [
+                {
+                    "id": road.id,
+                    "r0": road.r0,
+                    "r_optimized": float(R_opt[i]),
+                    "min_r": road.min_r,
+                    "max_r": road.max_r,
+                    "change_percent": float((R_opt[i] - road.r0) / road.r0 * 100) if road.r0 != 0 else 0
+                }
+                for i, road in enumerate(self.network_data.roads)
+            ]
+        
+        # 保存汇总文件
+        summary_path = os.path.join(self.run_dir, "summary.json")
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"最终结果已保存到: {summary_path}")
+        
+        return summary_path
+
+
 class LiveCMAESOptimizer:
     """
     带实时可视化的 CMA-ES 优化器
@@ -269,16 +440,19 @@ class LiveCMAESOptimizer:
     def __init__(self, 
                  problem,
                  config,
-                 visualizer: Optional[LiveVisualizer] = None):
+                 visualizer: Optional[LiveVisualizer] = None,
+                 result_saver: Optional[IterationResultSaver] = None):
         """
         参数:
         - problem: InversionProblem 实例
         - config: CMAESConfig 配置
         - visualizer: LiveVisualizer 实例（可选）
+        - result_saver: IterationResultSaver 实例（可选）
         """
         self.problem = problem
         self.config = config
         self.visualizer = visualizer
+        self.result_saver = result_saver
         self._cma = None
     
     def _import_cma(self):
@@ -351,15 +525,18 @@ class LiveCMAESOptimizer:
                 x_history.append(x_best.copy())
                 loss_history.append(current_best_loss)
                 
+                # 计算预测值（用于可视化和保存）
+                y_pred = None
+                y_target = None
+                if forward_fn_for_vis:
+                    try:
+                        y_pred = forward_fn_for_vis(x_best)
+                        y_target = self.visualizer.y_target if self.visualizer else None
+                    except:
+                        pass
+                
                 # 更新可视化
                 if self.visualizer:
-                    y_pred = None
-                    if forward_fn_for_vis:
-                        try:
-                            y_pred = forward_fn_for_vis(x_best)
-                        except:
-                            pass
-                    
                     self.visualizer.update_state(
                         iteration=es.countiter,
                         loss=current_best_loss,
@@ -373,10 +550,25 @@ class LiveCMAESOptimizer:
                     # 刷新显示
                     plt.pause(0.01)
                 
+                # 保存迭代结果到JSON
+                if self.result_saver:
+                    elapsed = time.time() - start_time
+                    self.result_saver.save_iteration(
+                        iteration=es.countiter,
+                        x_best=x_best,
+                        loss=current_best_loss,
+                        best_loss=best_loss,
+                        sigma=es.sigma,
+                        eval_count=self.problem._eval_count,
+                        elapsed_time=elapsed,
+                        y_pred=y_pred,
+                        y_target=y_target
+                    )
+                
                 # 打印进度
                 if es.countiter % 10 == 0:
-                    print(f"迭代 {es.countiter}: 损失={current_best_loss:.4e}, "
-                          f"最佳={best_loss:.4e}, σ={es.sigma:.4f}")
+                    print(f"Iter {es.countiter}: Loss={current_best_loss:.4e}, "
+                          f"Best={best_loss:.4e}, Sigma={es.sigma:.4f}")
         
         except KeyboardInterrupt:
             print("\n优化被用户中断")
@@ -405,16 +597,34 @@ class LiveCMAESOptimizer:
             elapsed_time=elapsed_time
         )
         
+        # 保存最终汇总结果
+        if self.result_saver:
+            self.result_saver.save_final_summary(
+                result=result,
+                total_iterations=es.countiter
+            )
+        
         return result
 
 
 def run_with_live_visualization(
     json_path: str = "input.json",
     max_iter: int = 50,
-    use_mvn_solver: bool = True
+    use_mvn_solver: bool = True,
+    save_results: bool = True,
+    save_every: int = 1,
+    output_dir: str = "results"
 ):
     """
     运行带实时可视化的反演
+    
+    参数:
+    - json_path: 数据文件路径
+    - max_iter: 最大迭代次数
+    - use_mvn_solver: 是否使用MVN Solver
+    - save_results: 是否保存每次迭代结果
+    - save_every: 每隔多少次迭代保存一次
+    - output_dir: 结果输出目录
     """
     from real_data_inversion import (
         DataLoader, RealDataInversionConfig,
@@ -424,31 +634,31 @@ def run_with_live_visualization(
     from ventilation_inversion import InversionBounds, CMAESConfig
     
     print("="*70)
-    print("矿井通风阻力系数反演 - 实时可视化模式")
+    print("CMA-ES Inversion with Live Visualization")
     print("="*70)
     
     # 加载数据
-    print("\n[1] 加载数据...")
+    print("\n[1] Loading data...")
     network = DataLoader.load(json_path)
     
     # 创建前向模型
-    print("\n[2] 创建前向模型...")
+    print("\n[2] Creating forward model...")
     if use_mvn_solver:
         try:
             forward_model = MVNSolverWrapper(
                 network=network,
                 json_path=json_path
             )
-            print("  使用 MVN Solver")
+            print("  Using MVN Solver")
         except ImportError:
-            print("  MVN Solver 不可用，使用简化模型")
+            print("  MVN Solver not available, using simplified model")
             forward_model = SimplifiedForwardModel(network)
     else:
         forward_model = SimplifiedForwardModel(network)
-        print("  使用简化模型")
+        print("  Using simplified model")
     
     # 配置反演
-    print("\n[3] 配置反演问题...")
+    print("\n[3] Configuring inversion problem...")
     inv_config = RealDataInversionConfig(
         network_data=network,
         forward_model=forward_model,
@@ -459,11 +669,22 @@ def run_with_live_visualization(
     problem = inv_config.create_inversion_problem()
     
     # 创建可视化器
-    print("\n[4] 初始化可视化器...")
+    print("\n[4] Initializing visualizer...")
     visualizer = LiveVisualizer(
         y_target=inv_config.target_values,
         update_interval=0.5
     )
+    
+    # 创建结果保存器
+    result_saver = None
+    if save_results:
+        print(f"\n[5] Setting up result saver (save every {save_every} iterations)...")
+        result_saver = IterationResultSaver(
+            output_dir=output_dir,
+            save_every=save_every,
+            network_data=network,
+            inv_config=inv_config
+        )
     
     # 创建用于可视化的前向函数
     def forward_for_vis(x):
@@ -481,11 +702,16 @@ def run_with_live_visualization(
     )
     
     # 创建优化器
-    optimizer = LiveCMAESOptimizer(problem, cma_config, visualizer)
+    optimizer = LiveCMAESOptimizer(
+        problem, 
+        cma_config, 
+        visualizer,
+        result_saver=result_saver
+    )
     
     # 运行优化
-    print("\n[5] 开始优化（实时可视化）...")
-    print("    按 Ctrl+C 可中断优化\n")
+    print(f"\n[6] Starting optimization (max {max_iter} iterations)...")
+    print("    Press Ctrl+C to interrupt\n")
     
     x0 = inv_config.get_initial_guess()
     result = optimizer.run(x0, forward_fn_for_vis=forward_for_vis)
@@ -511,15 +737,23 @@ if __name__ == "__main__":
     
     max_iter = 50
     use_mvn = False
+    save_every = 1
+    no_save = False
     
     for arg in sys.argv[1:]:
         if arg == "--mvn":
             use_mvn = True
         elif arg.startswith("--iter="):
             max_iter = int(arg.split("=")[1])
+        elif arg.startswith("--save-every="):
+            save_every = int(arg.split("=")[1])
+        elif arg == "--no-save":
+            no_save = True
     
     result, config, network = run_with_live_visualization(
         max_iter=max_iter,
-        use_mvn_solver=use_mvn
+        use_mvn_solver=use_mvn,
+        save_results=not no_save,
+        save_every=save_every
     )
 

@@ -26,13 +26,16 @@ pip install -r requirements.txt
 ### 运行演示
 
 ```bash
-# 使用实际数据运行反演 ⭐
-python real_data_inversion.py
+# 使用 MVN Solver 运行反演（推荐）⭐
+python real_data_inversion.py --mvn --iter=50
 
-# 运行简化模型演示
-python ventilation_inversion.py
+# 使用简化模型（快速测试）
+python real_data_inversion.py --iter=200
 
-# 生成可视化图表
+# 实时可视化模式 ⭐
+python live_visualization.py --mvn --iter=30
+
+# 生成静态可视化图表
 python visualization.py
 ```
 
@@ -281,6 +284,62 @@ def my_solver(R_dict, H_dict):
     return your_solver.solve(R_dict, H_dict)
 
 forward_model = ExternalSolverWrapper(network, my_solver)
+```
+
+## 📊 实时可视化
+
+使用 `live_visualization.py` 可以在优化过程中实时监控关键指标：
+
+```bash
+# 使用简化模型（快速测试）
+python live_visualization.py --iter=50
+
+# 使用 MVN Solver（真实求解器）
+python live_visualization.py --mvn --iter=30
+
+# 控制结果保存频率（每5次迭代保存一次）
+python live_visualization.py --mvn --iter=100 --save-every=5
+
+# 不保存迭代结果（只保存最终结果）
+python live_visualization.py --iter=50 --no-save
+```
+
+**实时显示的指标：**
+- 损失函数收敛曲线
+- CMA-ES 步长 (sigma) 变化
+- 残差分布（预测值 - 目标值）
+- 预测值 vs 目标值散点图
+- 状态栏：迭代次数、损失值、RMSE、相对误差、运行时间
+
+**输出文件：**
+- `optimization_final.png` - 优化结束时的图表截图
+- `results/run_YYYYMMDD_HHMMSS/` - 每次运行的结果目录
+  - `iter_00001.json` - 每次迭代的详细结果
+  - `summary.json` - 最终汇总结果
+  - `run_config.json` - 运行配置
+
+**迭代结果 JSON 结构：**
+```json
+{
+  "iteration": 10,
+  "timestamp": "2025-11-27T16:30:00.698051",
+  "metrics": {
+    "loss": 0.0098,
+    "best_loss": 0.0089,
+    "sigma": 0.28,
+    "eval_count": 250,
+    "rmse": 5.23,
+    "relative_error_percent": 12.5
+  },
+  "optimized_R": {
+    "e1": {"r0": 3.225, "r_optimized": 4.09, "change_percent": 26.9},
+    ...
+  },
+  "measurements": {
+    "e1": {"target": 13.67, "predicted": 14.2, "residual": 0.53},
+    ...
+  }
+}
 ```
 
 ## 📈 性能指标
