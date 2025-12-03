@@ -29,11 +29,21 @@ pip install -r requirements.txt
 # 使用 MVN Solver 运行反演（推荐）⭐
 python real_data_inversion.py --mvn --iter=50
 
+# 同时优化风阻和风机压力 (fanHs) ⭐
+python real_data_inversion.py --mvn --optimize-fan --iter=50
+
 # 使用简化模型（快速测试）
 python real_data_inversion.py --iter=200
 
 # 实时可视化模式 ⭐
 python live_visualization.py --mvn --iter=30
+
+# 实时可视化 + 风机优化
+python live_visualization.py --mvn --optimize-fan --iter=30
+
+# 自定义 BIPOP / 并行策略
+python live_visualization.py --mvn --iter=80 --workers=8 --pop-large=2.5 --pop-small=0.6
+python live_visualization.py --mvn --iter=80 --no-bipop --no-parallel
 
 # 生成静态可视化图表
 python visualization.py
@@ -310,6 +320,12 @@ python live_visualization.py --iter=50 --no-save
 - 残差分布（预测值 - 目标值）
 - 预测值 vs 目标值散点图
 - 状态栏：迭代次数、损失值、RMSE、相对误差、运行时间
+
+**并行 BIPOP-CMA-ES 特性：**
+- 默认启用 **BIPOP**（大小种群交替），快速在全局/局部搜索间切换
+- 默认启用 **多进程适应度评估**，自动使用 `CPU-1` 个进程（可通过 `--workers=` 指定）
+- 可使用 `--no-bipop` / `--no-parallel` 临时禁用这些功能
+- `--pop-large=` / `--pop-small=` 可自定义大小种群比例
 
 **输出文件：**
 - `optimization_final.png` - 优化结束时的图表截图

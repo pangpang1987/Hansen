@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 import logging
 import time
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
 
 # 配置日志
 logging.basicConfig(
@@ -20,6 +23,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# 注意：由于 forward_fn 可能是闭包，无法被 pickle 序列化
+# 并行计算会在检测到序列化失败时自动回退到串行模式
 
 
 # ============================================================================
@@ -277,6 +283,10 @@ class InversionProblem:
         
         # 评估计数器
         self._eval_count = 0
+        
+        # 缓存评估结果（用于避免重复调用前向模型）
+        self._cache = {}  # key: x的hash, value: (x, y_pred, loss)
+        self._cache_max_size = 200  # 最大缓存数量
     
     @property
     def dim(self) -> int:
@@ -318,10 +328,39 @@ class InversionProblem:
             # 计算损失
             loss = self.loss_fn(y_pred, self.y_target, self.measurement_weights)
             
+            # 缓存结果（用于后续复用，避免重复调用前向模型）
+            x_key = hash(x.tobytes())
+            self._cache[x_key] = (x.copy(), y_pred.copy() if hasattr(y_pred, 'copy') else np.array(y_pred), loss)
+            
+            # 限制缓存大小
+            if len(self._cache) > self._cache_max_size:
+                # 删除一半的缓存（简单策略）
+                keys = list(self._cache.keys())
+                for k in keys[:len(keys)//2]:
+                    del self._cache[k]
+            
             return loss
         except Exception as e:
             logger.warning(f"前向模型评估失败: {e}")
             return 1e10
+    
+    def get_cached_prediction(self, x: np.ndarray) -> Optional[np.ndarray]:
+        """
+        获取缓存的预测值（如果 x 在缓存中）
+        
+        用于避免在欧式距离计算等场景中重复调用前向模型
+        """
+        x_key = hash(x.tobytes())
+        if x_key in self._cache:
+            cached_x, cached_y_pred, _ = self._cache[x_key]
+            # 验证 x 确实匹配（防止hash冲突）
+            if np.allclose(x, cached_x, rtol=1e-10, atol=1e-10):
+                return cached_y_pred
+        return None
+    
+    def clear_cache(self):
+        """清空预测值缓存"""
+        self._cache.clear()
     
     def evaluate_solution(self, x: np.ndarray) -> Dict:
         """
@@ -365,14 +404,30 @@ class CMAESConfig:
     # 高级选项
     restart_from_best: bool = True       # 是否从最佳点重启
     bounds_handling: str = 'penalty'     # 边界处理方式: 'penalty' 或 'clip'
+    
+    # BIPOP-CMA-ES 参数（大小种群交替）
+    use_bipop: bool = True               # 是否使用 BIPOP-CMA-ES（大小种群交替）
+    popsize_large_ratio: float = 2.0     # 大种群相对于默认种群的比例
+    popsize_small_ratio: float = 0.5     # 小种群相对于默认种群的比例
+    switch_interval: int = 20            # 种群大小切换间隔（迭代次数）
+    switch_condition: str = 'interval'   # 切换条件: 'interval'（固定间隔）或 'stagnation'（停滞时切换）
+    stagnation_threshold: float = 1e-6   # 停滞判断阈值（相对改进）
+    stagnation_window: int = 10          # 停滞判断窗口（迭代次数）
+    
+    # 并行计算参数
+    use_parallel: bool = True             # 是否使用并行计算
+    n_workers: Optional[int] = None      # 并行进程数（None 则自动检测，使用 CPU 核心数）
+    parallel_backend: str = 'multiprocessing'  # 并行后端: 'multiprocessing' 或 'concurrent.futures'
+    reuse_pool: bool = True              # 是否重用进程池（避免重复创建开销）
 
 
 class CMAESOptimizer:
     """
-    CMA-ES 优化器封装类
+    CMA-ES 优化器封装类（支持 BIPOP-CMA-ES：大小种群交替）
     
     提供：
     - 与 InversionProblem 的无缝集成
+    - BIPOP-CMA-ES：大小种群交替策略（最强版本）
     - 多次运行支持（检测多个局部最优）
     - 详细的收敛日志
     - 结果后处理
@@ -389,6 +444,26 @@ class CMAESOptimizer:
         
         # 延迟导入 cma 库
         self._cma = None
+        
+        # BIPOP-CMA-ES 状态
+        self._bipop_state = {
+            'current_popsize': None,
+            'popsize_large': None,
+            'popsize_small': None,
+            'last_switch_iter': 0,
+            'last_best_loss': None,
+            'stagnation_count': 0,
+            'use_large_pop': True  # 初始使用大种群
+        }
+        
+        # 并行计算状态
+        self._pool = None
+        self._n_workers = None
+        if self.config.use_parallel:
+            self._n_workers = self.config.n_workers
+            if self._n_workers is None:
+                self._n_workers = max(1, mp.cpu_count() - 1)  # 保留一个核心给主进程
+            self._n_workers = min(self._n_workers, mp.cpu_count())
     
     def _import_cma(self):
         """延迟导入 CMA-ES 库"""
@@ -403,9 +478,210 @@ class CMAESOptimizer:
                 )
         return self._cma
     
+    def _initialize_bipop(self, dim: int, default_popsize: Optional[int] = None):
+        """初始化 BIPOP-CMA-ES 参数"""
+        if default_popsize is None:
+            # 计算默认种群大小（CMA-ES 标准公式）
+            default_popsize = 4 + int(3 * np.log(dim))
+        
+        # 计算大小种群
+        self._bipop_state['popsize_large'] = max(
+            int(default_popsize * self.config.popsize_large_ratio),
+            default_popsize + 1
+        )
+        self._bipop_state['popsize_small'] = max(
+            int(default_popsize * self.config.popsize_small_ratio),
+            4  # 最小种群大小
+        )
+        
+        # 初始使用大种群
+        self._bipop_state['current_popsize'] = self._bipop_state['popsize_large']
+        self._bipop_state['use_large_pop'] = True
+        self._bipop_state['last_switch_iter'] = 0
+        self._bipop_state['last_best_loss'] = None
+        self._bipop_state['stagnation_count'] = 0
+        
+        if self.config.verbose >= 1:
+            logger.info(
+                f"BIPOP-CMA-ES 初始化: "
+                f"大种群={self._bipop_state['popsize_large']}, "
+                f"小种群={self._bipop_state['popsize_small']}, "
+                f"默认={default_popsize}"
+            )
+    
+    def _should_switch_population(self, current_iter: int, current_best_loss: float) -> bool:
+        """判断是否应该切换种群大小"""
+        if not self.config.use_bipop:
+            return False
+        
+        state = self._bipop_state
+        
+        if self.config.switch_condition == 'interval':
+            # 固定间隔切换
+            if current_iter - state['last_switch_iter'] >= self.config.switch_interval:
+                return True
+        elif self.config.switch_condition == 'stagnation':
+            # 停滞时切换
+            if state['last_best_loss'] is not None:
+                # 计算相对改进
+                relative_improvement = abs(state['last_best_loss'] - current_best_loss) / (
+                    abs(state['last_best_loss']) + 1e-10
+                )
+                
+                if relative_improvement < self.config.stagnation_threshold:
+                    state['stagnation_count'] += 1
+                else:
+                    state['stagnation_count'] = 0
+                
+                if state['stagnation_count'] >= self.config.stagnation_window:
+                    return True
+        
+        return False
+    
+    def _switch_population_size(self):
+        """切换种群大小"""
+        state = self._bipop_state
+        state['use_large_pop'] = not state['use_large_pop']
+        
+        if state['use_large_pop']:
+            state['current_popsize'] = state['popsize_large']
+        else:
+            state['current_popsize'] = state['popsize_small']
+        
+        state['last_switch_iter'] = 0  # 重置切换计数器
+        state['stagnation_count'] = 0
+        
+        if self.config.verbose >= 1:
+            pop_type = "大种群" if state['use_large_pop'] else "小种群"
+            logger.info(
+                f"切换到{pop_type} (大小={state['current_popsize']})"
+            )
+    
+    def _get_pool(self):
+        """获取或创建进程池"""
+        if not self.config.use_parallel:
+            return None
+        
+        if self.config.reuse_pool:
+            if self._pool is None:
+                if self.config.parallel_backend == 'multiprocessing':
+                    self._pool = mp.Pool(processes=self._n_workers)
+                elif self.config.parallel_backend == 'concurrent.futures':
+                    self._pool = ProcessPoolExecutor(max_workers=self._n_workers)
+            return self._pool
+        else:
+            # 每次创建新池（不重用）
+            if self.config.parallel_backend == 'multiprocessing':
+                return mp.Pool(processes=self._n_workers)
+            elif self.config.parallel_backend == 'concurrent.futures':
+                return ProcessPoolExecutor(max_workers=self._n_workers)
+    
+    def _close_pool(self, pool):
+        """关闭进程池"""
+        if pool is None:
+            return
+        
+        if self.config.reuse_pool:
+            # 重用池时不关闭
+            return
+        
+        if isinstance(pool, ProcessPoolExecutor):
+            pool.shutdown(wait=True)
+        elif isinstance(pool, mp.pool.Pool):
+            pool.close()
+            pool.join()
+    
+    def _evaluate_fitness_parallel(self, solutions: List[np.ndarray], pool) -> List[float]:
+        """并行评估适应度"""
+        if pool is None:
+            # 回退到串行
+            return [self.problem.objective(x) for x in solutions]
+        
+        # 尝试并行计算
+        # 注意：如果 problem.objective 包含不可序列化的闭包，会自动回退到串行
+        try:
+            # 只在第一次测试序列化（避免每次都测试，且缓存可能导致序列化失败）
+            if not hasattr(self, '_parallel_ok'):
+                try:
+                    # 临时清空缓存以便序列化测试
+                    old_cache = getattr(self.problem, '_cache', {})
+                    if hasattr(self.problem, '_cache'):
+                        self.problem._cache = {}
+                    
+                    import pickle
+                    pickle.dumps(self.problem.objective)
+                    self._parallel_ok = True
+                    
+                    # 恢复缓存
+                    if hasattr(self.problem, '_cache'):
+                        self.problem._cache = old_cache
+                        
+                    if self.config.verbose >= 1:
+                        logger.info("并行计算序列化测试通过")
+                except Exception as e:
+                    self._parallel_ok = False
+                    if self.config.verbose >= 1:
+                        logger.warning(
+                            f"并行计算序列化测试失败，将使用串行模式: {e}\n"
+                            f"提示：如果 forward_fn 是闭包，建议在 RealDataInversionConfig 中使用类方法而非闭包"
+                        )
+            
+            if not self._parallel_ok:
+                return [self.problem.objective(x) for x in solutions]
+            
+            if isinstance(pool, ProcessPoolExecutor):
+                # 使用 concurrent.futures（保持顺序）
+                futures = [pool.submit(self.problem.objective, x) for x in solutions]
+                return [f.result() for f in futures]  # 保持顺序
+            elif isinstance(pool, mp.pool.Pool):
+                # 使用 multiprocessing.Pool
+                return pool.map(self.problem.objective, solutions)
+            else:
+                # 未知类型，回退到串行
+                return [self.problem.objective(x) for x in solutions]
+        except (pickle.PicklingError, AttributeError, TypeError, ValueError) as e:
+            # 如果目标函数不可序列化，回退到串行
+            self._parallel_ok = False
+            if self.config.verbose >= 1:
+                logger.warning(f"并行计算执行失败，回退到串行: {e}")
+            return [self.problem.objective(x) for x in solutions]
+        except Exception as e:
+            # 其他错误也回退到串行
+            if self.config.verbose >= 1:
+                logger.warning(f"并行计算失败，回退到串行: {e}")
+            return [self.problem.objective(x) for x in solutions]
+    
+    def _evaluate_fitness(self, solutions: List[np.ndarray]) -> List[float]:
+        """评估适应度（自动选择并行或串行）"""
+        if not self.config.use_parallel or len(solutions) == 1:
+            # 串行评估
+            return [self.problem.objective(x) for x in solutions]
+        
+        # 并行评估
+        pool = self._get_pool()
+        try:
+            fitness = self._evaluate_fitness_parallel(solutions, pool)
+        except Exception as e:
+            if self.config.verbose >= 1:
+                logger.warning(f"并行计算失败，回退到串行: {e}")
+            fitness = [self.problem.objective(x) for x in solutions]
+        finally:
+            self._close_pool(pool if not self.config.reuse_pool else None)
+        
+        return fitness
+    
+    def __del__(self):
+        """析构函数：清理进程池"""
+        if self._pool is not None:
+            if isinstance(self._pool, ProcessPoolExecutor):
+                self._pool.shutdown(wait=False)
+            elif isinstance(self._pool, mp.pool.Pool):
+                self._pool.terminate()
+                self._pool.join()
+    
     def run(self, x0: Optional[np.ndarray] = None) -> InversionResult:
         """
-        运行单次 CMA-ES 优化
+        运行单次 CMA-ES 优化（支持 BIPOP-CMA-ES：大小种群交替）
         
         参数:
         - x0: 初始点（None 则使用边界中心）
@@ -426,6 +702,14 @@ class CMAESOptimizer:
         # 重置评估计数
         self.problem.reset_eval_count()
         
+        # 初始化 BIPOP 参数
+        default_popsize = self.config.popsize
+        if self.config.use_bipop:
+            self._initialize_bipop(self.problem.dim, default_popsize)
+            current_popsize = self._bipop_state['current_popsize']
+        else:
+            current_popsize = default_popsize
+        
         # 配置 CMA-ES 选项
         opts = {
             'maxiter': self.config.maxiter,
@@ -435,65 +719,239 @@ class CMAESOptimizer:
             'bounds': [self.problem.bounds.lower.tolist(), 
                        self.problem.bounds.upper.tolist()],
             'verbose': self.config.verbose - 1,  # cma 的 verbose 从 -1 开始
-            'seed': self.config.seed
+            'seed': self.config.seed,
+            'popsize': current_popsize
         }
-        
-        if self.config.popsize is not None:
-            opts['popsize'] = self.config.popsize
         
         # 记录历史
         x_history = []
         loss_history = []
+        popsize_history = []  # 记录种群大小变化
         
         start_time = time.time()
         
         # 创建优化器并运行
         if self.config.verbose >= 1:
-            logger.info(f"开始 CMA-ES 优化 (维度={self.problem.dim}, σ₀={sigma0:.4f})")
+            mode_str = "BIPOP-CMA-ES (大小种群交替)" if self.config.use_bipop else "CMA-ES"
+            parallel_info = f", 并行进程={self._n_workers}" if self.config.use_parallel else ""
+            logger.info(
+                f"开始 {mode_str} 优化 "
+                f"(维度={self.problem.dim}, σ₀={sigma0:.4f}, "
+                f"初始种群={current_popsize}{parallel_info})"
+            )
         
         es = cma.CMAEvolutionStrategy(x0, sigma0, opts)
+        best_loss_so_far = float('inf')
+        best_x_so_far = x0.copy()
+        
+        iteration_count = 0  # 手动跟踪迭代次数（因为切换时会重置 es.countiter）
+        
+        # 计时统计
+        timing_stats = {
+            'iteration_times': [],
+            'step_times': {
+                'bipop_check': [],
+                'ask': [],
+                'evaluate': [],
+                'tell': [],
+                'history_update': []
+            },
+            'individual_eval_times': []
+        }
         
         while not es.stop():
-            # 生成候选解
+            iter_start_time = time.time()
+            step_times = {}
+            
+            # ========== 步骤1: BIPOP 检查/切换 ==========
+            t0 = time.time()
+            if self.config.use_bipop and iteration_count > 0:
+                if self._should_switch_population(iteration_count, best_loss_so_far):
+                    # 保存当前状态
+                    current_x = es.result.xbest
+                    current_sigma = es.sigma
+                    
+                    # 切换种群大小
+                    self._switch_population_size()
+                    new_popsize = self._bipop_state['current_popsize']
+                    
+                    # 创建新的优化器，从当前最佳点重启
+                    new_opts = opts.copy()
+                    new_opts['popsize'] = new_popsize
+                    
+                    # 从当前最佳点重启，保持 sigma
+                    es = cma.CMAEvolutionStrategy(current_x, current_sigma, new_opts)
+                    
+                    if self.config.verbose >= 1:
+                        pop_type = "大种群" if self._bipop_state['use_large_pop'] else "小种群"
+                        logger.info(
+                            f"迭代 {iteration_count}: 切换到{pop_type} "
+                            f"(大小={new_popsize}), 当前最优损失={best_loss_so_far:.6e}"
+                        )
+            step_times['bipop_check'] = time.time() - t0
+            
+            # ========== 步骤2: 生成候选解 ==========
+            t0 = time.time()
             solutions = es.ask()
+            step_times['ask'] = time.time() - t0
             
-            # 评估适应度
-            fitness = [self.problem.objective(x) for x in solutions]
+            # ========== 步骤3: 评估适应度（并行或串行）==========
+            t0 = time.time()
+            individual_times = []
+            if self.config.use_parallel:
+                # 并行模式：记录总时间
+                fitness = self._evaluate_fitness(solutions)
+                avg_time = (time.time() - t0) / len(solutions)
+                individual_times = [avg_time] * len(solutions)
+            else:
+                # 串行模式：记录每个个体的评估时间
+                fitness = []
+                for sol in solutions:
+                    t_ind = time.time()
+                    f = self.problem.objective(sol)
+                    individual_times.append(time.time() - t_ind)
+                    fitness.append(f)
+            step_times['evaluate'] = time.time() - t0
+            timing_stats['individual_eval_times'].append(individual_times)
             
-            # 更新优化器
+            # ========== 步骤4: 更新优化器 ==========
+            t0 = time.time()
             es.tell(solutions, fitness)
+            step_times['tell'] = time.time() - t0
             
-            # 记录历史
+            # ========== 步骤5: 记录历史 ==========
+            t0 = time.time()
             x_best_gen = solutions[np.argmin(fitness)]
             loss_best_gen = min(fitness)
+            
+            # 更新全局最优
+            if loss_best_gen < best_loss_so_far:
+                best_loss_so_far = loss_best_gen
+                best_x_so_far = x_best_gen.copy()
+            
             x_history.append(x_best_gen.copy())
             loss_history.append(loss_best_gen)
             
-            # 日志输出
+            # 记录当前种群大小
+            current_popsize_iter = len(solutions)
+            popsize_history.append(current_popsize_iter)
+            
+            # 更新迭代计数
+            iteration_count += 1
+            
+            # 更新 BIPOP 状态
+            if self.config.use_bipop:
+                self._bipop_state['last_switch_iter'] += 1
+                self._bipop_state['last_best_loss'] = best_loss_so_far
+            step_times['history_update'] = time.time() - t0
+            
+            # ========== 计算迭代总时间并记录统计 ==========
+            iter_total_time = time.time() - iter_start_time
+            timing_stats['iteration_times'].append(iter_total_time)
+            for key in step_times:
+                timing_stats['step_times'][key].append(step_times[key])
+            
+            # 日志输出（详细计时信息）
             if self.config.verbose >= 2:
+                pop_size = len(solutions)
+                eval_time = step_times['evaluate']
+                avg_eval_time = eval_time / pop_size if pop_size > 0 else 0
+                popsize_info = f", 种群={current_popsize_iter}" if self.config.use_bipop else ""
                 logger.info(
-                    f"迭代 {es.countiter}: "
+                    f"迭代 {iteration_count}: "
                     f"最优损失={loss_best_gen:.6e}, "
-                    f"sigma={es.sigma:.4e}"
+                    f"sigma={es.sigma:.4e}{popsize_info}, "
+                    f"用时={iter_total_time*1000:.1f}ms (评估={eval_time*1000:.1f}ms, {avg_eval_time*1000:.2f}ms/个体)"
+                )
+            elif self.config.verbose >= 1 and iteration_count % 10 == 0:
+                # 每10次迭代输出一次简要信息
+                pop_size = len(solutions)
+                eval_time = step_times['evaluate']
+                logger.info(
+                    f"迭代 {iteration_count}: 损失={loss_best_gen:.6e}, "
+                    f"用时={iter_total_time*1000:.1f}ms (评估={eval_time*1000:.1f}ms)"
                 )
         
         elapsed_time = time.time() - start_time
         
-        # 获取最终结果
-        result = es.result
-        x_best = result.xbest
-        loss_best = result.fbest
+        # 获取最终结果（使用全局最优）
+        x_best = best_x_so_far
+        loss_best = best_loss_so_far
+        
+        # 计算种群切换次数
+        bipop_switches = 0
+        if self.config.use_bipop and len(popsize_history) > 1:
+            bipop_switches = len([i for i in range(1, len(popsize_history)) 
+                                  if popsize_history[i] != popsize_history[i-1]])
         
         # 收敛信息
         convergence_info = {
             'stop_conditions': es.stop(),
-            'iterations': es.countiter,
+            'iterations': iteration_count,
             'final_sigma': es.sigma,
-            'condition_number': es.D.max() / es.D.min() if hasattr(es, 'D') else None
+            'condition_number': es.D.max() / es.D.min() if hasattr(es, 'D') else None,
+            'popsize_history': popsize_history if self.config.use_bipop else None,
+            'bipop_switches': bipop_switches
         }
         
         if self.config.verbose >= 1:
-            logger.info(f"优化完成: 损失={loss_best:.6e}, 迭代={es.countiter}")
+            switch_info = f", 种群切换={bipop_switches}次" if self.config.use_bipop else ""
+            parallel_info = f", 并行加速" if self.config.use_parallel else ""
+            logger.info(
+                f"优化完成: 损失={loss_best:.6e}, 迭代={iteration_count}{switch_info}{parallel_info}"
+            )
+            
+            # 打印计时统计汇总
+            if timing_stats['iteration_times']:
+                n_iters = len(timing_stats['iteration_times'])
+                total_iter_time = sum(timing_stats['iteration_times'])
+                avg_iter_time = total_iter_time / n_iters
+                
+                logger.info("="*60)
+                logger.info("计时统计汇总")
+                logger.info("="*60)
+                logger.info(f"总迭代次数: {n_iters}")
+                logger.info(f"总运行时间: {elapsed_time:.2f}s")
+                logger.info(f"迭代总用时: {total_iter_time:.2f}s")
+                logger.info(f"平均每迭代: {avg_iter_time*1000:.1f}ms")
+                
+                step_names = {
+                    'bipop_check': 'BIPOP检查',
+                    'ask': '生成候选解',
+                    'evaluate': '适应度评估',
+                    'tell': '优化器更新',
+                    'history_update': '历史记录'
+                }
+                
+                logger.info("各步骤平均用时:")
+                for key, name in step_names.items():
+                    times = timing_stats['step_times'][key]
+                    if times:
+                        avg_time = sum(times) / len(times) * 1000
+                        total_time = sum(times) * 1000
+                        pct = (sum(times) / total_iter_time * 100) if total_iter_time > 0 else 0
+                        logger.info(f"  {name:12s}: 平均={avg_time:>8.2f}ms, 总计={total_time:>8.1f}ms ({pct:>5.1f}%)")
+                
+                # 显示个体评估时间统计
+                if timing_stats['individual_eval_times']:
+                    all_times = [t for times in timing_stats['individual_eval_times'] for t in times]
+                    if all_times:
+                        logger.info(f"个体评估时间统计 (共{len(all_times)}次评估):")
+                        logger.info(f"  最小: {min(all_times)*1000:.2f}ms")
+                        logger.info(f"  最大: {max(all_times)*1000:.2f}ms")
+                        logger.info(f"  平均: {sum(all_times)/len(all_times)*1000:.2f}ms")
+                        logger.info(f"  总计: {sum(all_times):.2f}s")
+                
+                logger.info("="*60)
+        
+        # 清理进程池
+        if self.config.reuse_pool and self._pool is not None:
+            if isinstance(self._pool, ProcessPoolExecutor):
+                self._pool.shutdown(wait=True)
+            elif isinstance(self._pool, mp.pool.Pool):
+                self._pool.close()
+                self._pool.join()
+            self._pool = None
         
         return InversionResult(
             x_best=x_best,

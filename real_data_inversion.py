@@ -17,6 +17,7 @@ import logging
 import sys
 import os
 import copy
+import pickle
 
 # 添加 cloud 目录到 Python 路径
 _current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -115,12 +116,13 @@ class DataLoader:
     """
     
     @staticmethod
-    def load(filepath: str) -> VentilationNetworkData:
+    def load(filepath: str, fix_bounds: bool = True) -> VentilationNetworkData:
         """
         加载JSON数据文件
         
         参数:
         - filepath: JSON文件路径
+        - fix_bounds: 是否自动修复越界的初始值
         
         返回:
         - VentilationNetworkData 对象
@@ -130,16 +132,36 @@ class DataLoader:
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
+        # 统计边界问题
+        r0_below_min = 0
+        r0_above_max = 0
+        
         # 解析巷道数据
         roads = []
         for i, r in enumerate(data.get('roads', [])):
+            r0 = r['r0']
+            min_r = r['minR']
+            max_r = r['maxR']
+            
+            # 检查并修复边界问题
+            if r0 < min_r:
+                r0_below_min += 1
+                if fix_bounds:
+                    # 将 r0 调整到边界内，或扩展边界
+                    min_r = r0 * 0.5  # 扩展下界
+            if r0 > max_r:
+                r0_above_max += 1
+                if fix_bounds:
+                    # 将 r0 调整到边界内，或扩展边界
+                    max_r = r0 * 2.0  # 扩展上界
+            
             road = RoadData(
                 id=r['id'],
                 source=r.get('s', ''),
                 target=r.get('t', ''),
-                r0=r['r0'],
-                min_r=r['minR'],
-                max_r=r['maxR'],
+                r0=r0,
+                min_r=min_r,
+                max_r=max_r,
                 init_q=r.get('initQ', 0.0),
                 target_q=r.get('targetQ'),
                 ex=r.get('ex', 2.0),
@@ -150,13 +172,28 @@ class DataLoader:
         
         # 解析风机数据
         fans = []
+        h0_out_of_bounds = 0
         for f in data.get('fanHs', []):
+            h0 = f['h0']
+            min_h = min(f['minH'], f['maxH'])  # 确保 min < max
+            max_h = max(f['minH'], f['maxH'])
+            
+            # 检查并修复边界问题
+            if h0 < min_h or h0 > max_h:
+                h0_out_of_bounds += 1
+                if fix_bounds:
+                    # 扩展边界以包含 h0
+                    if h0 < min_h:
+                        min_h = h0 * 1.1 if h0 < 0 else h0 * 0.9
+                    if h0 > max_h:
+                        max_h = h0 * 0.9 if h0 < 0 else h0 * 1.1
+            
             fan = FanData(
                 id=f['id'],
                 edge_id=f['eid'],
-                h0=f['h0'],
-                min_h=f['minH'],
-                max_h=f['maxH'],
+                h0=h0,
+                min_h=min_h,
+                max_h=max_h,
                 use=f.get('use', 'LOCAL')
             )
             fans.append(fan)
@@ -183,12 +220,81 @@ class DataLoader:
         logger.info(f"  风机数: {network.n_fans}")
         logger.info(f"  结构物数: {len(structures)}")
         
+        # 报告边界问题
+        if r0_below_min > 0 or r0_above_max > 0:
+            logger.warning(f"边界问题:")
+            logger.warning(f"  R0 低于下界: {r0_below_min}")
+            logger.warning(f"  R0 高于上界: {r0_above_max}")
+            if fix_bounds:
+                logger.info(f"  已自动扩展边界以包含初始值")
+        
+        if h0_out_of_bounds > 0:
+            logger.warning(f"  H0 超出边界: {h0_out_of_bounds}")
+            if fix_bounds:
+                logger.info(f"  已自动扩展边界以包含初始值")
+        
         return network
 
 
 # ============================================================================
 # 反演问题配置器
 # ============================================================================
+
+class SerializableForwardFn:
+    """
+    可序列化的前向函数包装类（支持并行计算）
+    
+    必须在模块级别定义，才能被 pickle 序列化。
+    存储必要的可序列化引用，而不是整个 config 对象。
+    """
+    def __init__(self, config):
+        # 只存储必要的可序列化引用
+        self.forward_model = config.forward_model
+        self.measurement_indices = config.measurement_indices
+        
+        # 存储解码参数所需的信息
+        self.n_r_params = config.n_r_params
+        self.n_h_params = config.n_h_params
+        self.h_start_idx = config.h_start_idx
+        self.use_log_scale = config.use_log_scale
+        self.network_roads = config.network.roads
+        self.network_fans = config.network.fans
+        self.fan_to_optimize = config.fan_to_optimize if hasattr(config, 'fan_to_optimize') else []
+    
+    def _decode_parameters(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """解码参数（从 config 中提取的逻辑）"""
+        # 解码风阻
+        if self.use_log_scale:
+            R = np.exp(x[:self.n_r_params])
+        else:
+            R = x[:self.n_r_params].copy()
+        
+        # 解码/填充风机压力
+        H = np.array([f.h0 for f in self.network_fans])
+        if self.n_h_params > 0:
+            for j, fan in enumerate(self.fan_to_optimize):
+                idx = self.h_start_idx + j
+                fan_idx = self.network_fans.index(fan)
+                H[fan_idx] = x[idx]
+        
+        return R, H
+    
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        """前向函数调用"""
+        R, H = self._decode_parameters(x)
+        Q_all = self.forward_model(R, H)
+        return Q_all[self.measurement_indices]
+    
+    def __getstate__(self):
+        """确保 forward_model 可序列化，否则抛出异常"""
+        try:
+            pickle.dumps(self.forward_model)
+        except Exception as e:
+            raise pickle.PicklingError(
+                f"forward_model 无法序列化: {e}"
+            )
+        return self.__dict__
+
 
 class RealDataInversionConfig:
     """
@@ -305,20 +411,47 @@ class RealDataInversionConfig:
         
         # 风阻边界
         for i, road in enumerate(self.network.roads):
+            # 确保边界有效
+            min_r = max(road.min_r, 1e-12)  # 避免零或负值
+            max_r = max(road.max_r, min_r * 1.01)  # 确保 max > min
+            
+            # 确保 r0 在边界内
+            if road.r0 < min_r:
+                min_r = road.r0 * 0.5
+            if road.r0 > max_r:
+                max_r = road.r0 * 2.0
+            
             if self.use_log_scale:
-                lower[i] = np.log(max(road.min_r, 1e-10))
-                upper[i] = np.log(road.max_r)
+                lower[i] = np.log(min_r)
+                upper[i] = np.log(max_r)
             else:
-                lower[i] = road.min_r
-                upper[i] = road.max_r
+                lower[i] = min_r
+                upper[i] = max_r
         
         # 风机边界
         if self.optimize_fan:
             for j, fan in enumerate(self.fan_to_optimize):
                 idx = self.h_start_idx + j
                 # 注意：风机压力通常为负值
-                lower[idx] = min(fan.min_h, fan.max_h)
-                upper[idx] = max(fan.min_h, fan.max_h)
+                min_h = min(fan.min_h, fan.max_h)
+                max_h = max(fan.min_h, fan.max_h)
+                
+                # 确保 h0 在边界内
+                if fan.h0 < min_h:
+                    min_h = fan.h0 * 1.1 if fan.h0 < 0 else fan.h0 * 0.9
+                if fan.h0 > max_h:
+                    max_h = fan.h0 * 0.9 if fan.h0 < 0 else fan.h0 * 1.1
+                
+                # 确保边界有效
+                if min_h >= max_h:
+                    # 如果边界无效，创建一个小范围
+                    center = fan.h0
+                    half_range = abs(center) * 0.1 + 1.0
+                    min_h = center - half_range
+                    max_h = center + half_range
+                
+                lower[idx] = min_h
+                upper[idx] = max_h
         
         return InversionBounds(lower=lower, upper=upper)
     
@@ -378,15 +511,13 @@ class RealDataInversionConfig:
     def create_inversion_problem(self) -> InversionProblem:
         """
         创建完整的反演问题实例
+        
+        注意：为了支持并行计算，forward_fn 使用模块级别的可序列化类而非闭包
         """
         bounds = self.get_bounds()
-        objective = self.create_objective_function()
         
-        # 创建前向函数包装
-        def forward_fn(x: np.ndarray) -> np.ndarray:
-            R, H = self.decode_parameters(x)
-            Q_all = self.forward_model(R, H)
-            return Q_all[self.measurement_indices]
+        # 使用模块级别的可序列化类（支持并行计算）
+        forward_fn = SerializableForwardFn(self)
         
         # 参数名称
         param_names = [f"R_{r.id}" for r in self.network.roads]
@@ -618,6 +749,11 @@ class MVNSolverWrapper:
             'structureHs': structure_hs
         }
     
+    def _default_calcul_weight(self, initQs: Dict, roads: List) -> Dict:
+        """默认的权重计算函数（避免使用 lambda，以便序列化）"""
+        from jl.vn.ns.calcul_weight import calcul_weight
+        return calcul_weight(initQs=initQs, weightType="R*Q", roads=roads)
+    
     def __call__(self, R: np.ndarray, H: np.ndarray) -> np.ndarray:
         """
         调用 mvn_solver 求解风网
@@ -631,15 +767,10 @@ class MVNSolverWrapper:
         """
         # 导入求解器（延迟导入）
         from jl.vn.ns.ns import mvn_solver
-        from jl.vn.ns.calcul_weight import calcul_weight
         
-        # 如果没有设置权重计算函数，使用默认的
+        # 如果没有设置权重计算函数，使用默认方法（避免 lambda）
         if self.calcul_weight_fn is None:
-            self.calcul_weight_fn = lambda initQs, roads: calcul_weight(
-                initQs=initQs, 
-                weightType="R*Q", 
-                roads=roads
-            )
+            self.calcul_weight_fn = self._default_calcul_weight
         
         # 创建求解器输入数据
         data_ns = self._create_solver_data(R, H)
@@ -1270,12 +1401,15 @@ def main():
     json_path = "input.json"
     use_mvn_solver = False
     max_iter = 200
+    optimize_fan = False
     
     for arg in sys.argv[1:]:
         if arg == "--mvn":
             use_mvn_solver = True
         elif arg.startswith("--iter="):
             max_iter = int(arg.split("=")[1])
+        elif arg == "--optimize-fan":
+            optimize_fan = True
         elif arg.endswith(".json"):
             json_path = arg
     
@@ -1314,9 +1448,13 @@ def main():
             print("如需使用真实求解器，请添加 --mvn 参数")
             forward_model = None
         
+        if optimize_fan:
+            print("\n启用风机压力优化（fanHs）")
+        
         result, config, network = run_real_data_demo(
             json_path=json_path,
             forward_model=forward_model,
+            optimize_fan=optimize_fan,
             max_iter=max_iter,
             use_log_scale=True
         )
@@ -1332,6 +1470,10 @@ def main():
         if not use_mvn_solver:
             print("\n提示：使用真实风网求解器运行命令：")
             print(f"  python real_data_inversion.py --mvn --iter={max_iter}")
+        
+        if not optimize_fan:
+            print("\n提示：同时优化风机压力运行命令：")
+            print(f"  python real_data_inversion.py --mvn --optimize-fan --iter={max_iter}")
         
     except FileNotFoundError:
         print(f"错误: 找不到数据文件 {json_path}")
